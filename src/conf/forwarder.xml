@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<forwarder>
+	<addr_pairs>
+		<addr_pair>
+			<gateway_ip_a>192.168.12.1</gateway_ip_a>
+			<gateway_ip_b>192.168.12.2</gateway_ip_b>
+		</addr_pair>
+
+		<addr_pair>
+			<gateway_ip_a>192.168.23.3</gateway_ip_a>
+			<gateway_ip_b>192.168.23.2</gateway_ip_b>
+		</addr_pair>
+	</addr_pairs>
+</forwarder>
