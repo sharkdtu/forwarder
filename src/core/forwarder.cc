@@ -218,29 +218,25 @@ void Forwarder::run()
 					Pkt_header* pkthdr = new Pkt_header;
 					int bytes_received = recv(sockfd, pkthdr, sizeof(Pkt_header), 0);
 
-					if(bytes_received < 0)
-					{
-						if (errno != EAGAIN)
-						{
-							lg.err("recv error(%s)", strerror(errno));
-						}
-						break;
-					}
-					else if(bytes_received == 0)
-					{
-						lg.info("connection closed");
-						close(sockfd);
-						hash_map<int, int>::iterator it = port_to_sockfd.begin();
-						while(it != port_to_sockfd.end())
-						{
-							if(it->second == sockfd)
-							{
-								port_to_sockfd.erase(it);
-								break;
-							}
-						}
-						break;
-					}
+					
+                                        if(bytes_received <= 0)
+                                        {
+                                                if (errno != EAGAIN)
+                                                {
+                                                        lg.err("recv error(%s)", strerror(errno));
+                                                        close(sockfd);
+                                                        hash_map<int, int>::iterator it = port_to_sockfd.begin();
+                                                        while(it != port_to_sockfd.end())
+                                                        {
+                                                                if(it->second == sockfd)
+                                                                {
+                                                                        port_to_sockfd.erase(it);
+                                                                        break;
+                                                                }
+                                                        }
+                                                }
+                                                break;
+                                        }
 					else
 					{
 						if(bytes_received < sizeof(Pkt_header))
