@@ -43,6 +43,7 @@ enum Pkt_type
 };
 
 static Vlog_module lg("forwarder");
+
 const char* conf_file = "conf/forwarder.xml";
 
 static void make_sockfd_non_block(int sockfd)
@@ -85,14 +86,14 @@ Forwarder::Forwarder()
 		xmlNodePtr cur = root->xmlChildrenNode;
 		while(cur != NULL)
 		{
-			xmlNodePtr gwip = cur->xmlChildrenNode;
-			string gateway_ip_a((char*) xmlNodeGetContent(gwip));
-			gwip = gwip->next;
-			string gateway_ip_b((char*) xmlNodeGetContent(gwip));
-			ip_map[gateway_ip_a] = gateway_ip_b;
-			ip_map[gateway_ip_b] = gateway_ip_a;
-			ip_to_port[gateway_ip_a] = -1;
-			ip_to_port[gateway_ip_b] = -1;
+			xmlNodePtr ipptr = cur->xmlChildrenNode;
+			string pkt_src_ip((char*) xmlNodeGetContent(ipptr));
+			ipptr = ipptr->next;
+			string pkt_dst_ip((char*) xmlNodeGetContent(ipptr));
+			ip_map[pkt_src_ip] = pkt_dst_ip;
+			ip_map[pkt_dst_ip] = pkt_src_ip;
+			ip_to_port[pkt_src_ip] = -1;
+			ip_to_port[pkt_dst_ip] = -1;
 			cur=cur->next;
 		}
 	}
@@ -167,10 +168,10 @@ void Forwarder::run()
 				(!(events[i].events & EPOLLIN)))
 			{
 
-				lg.err("epool error(%s)", strerror(errno));
+				lg.err("epoll event error(%s)", strerror(errno));
 				if (epoll_ctl(epollfd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]) < 0)
 				{
-					lg.err("epool_ctl error(%s)", strerror(errno));
+					lg.err("epoll_ctl error(%s)", strerror(errno));
 					exit(EXIT_FAILURE);
 				}
 				close (events[i].data.fd);
@@ -193,19 +194,19 @@ void Forwarder::run()
 						break;
 					}
 
+					lg.dbg("new connection from %s", inet_ntoa(cliaddr.sin_addr));
+
 					int port = ntohs(cliaddr.sin_port);
 					port_to_sockfd[port] = connsockfd;
 
 					make_sockfd_non_block(connsockfd);
-
-					lg.dbg("new connection");
 
 					struct epoll_event ev;
 					ev.data.fd = connsockfd;
 					ev.events = EPOLLIN | EPOLLET;
 					if(epoll_ctl(epollfd, EPOLL_CTL_ADD, connsockfd, &ev) < 0)
 					{
-						lg.err("epool_ctl error(%s)", strerror(errno));
+						lg.err("epoll_ctl error(%s)", strerror(errno));
 						exit(EXIT_FAILURE);
 					}
 				}
@@ -217,47 +218,35 @@ void Forwarder::run()
 				{
 					Pkt_header* pkthdr = new Pkt_header;
 					int bytes_received = recv(sockfd, pkthdr, sizeof(Pkt_header), 0);
+					if(bytes_received <= 0)
+					{
+						if (errno != EAGAIN && errno != EWOULDBLOCK)
+						{
+							lg.err("recv error(%s)", strerror(errno));
+							if (epoll_ctl(epollfd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]) < 0)
+							{
+								lg.err("epoll_ctl error(%s)", strerror(errno));
+								exit(EXIT_FAILURE);
+							}
+							close(sockfd);
 
-					
-                                        if(bytes_received <= 0)
-                                        {
-                                                if (errno != EAGAIN)
-                                                {
-                                                        lg.err("recv error(%s)", strerror(errno));
-                                                        close(sockfd);
-                                                        hash_map<int, int>::iterator it = port_to_sockfd.begin();
-                                                        while(it != port_to_sockfd.end())
-                                                        {
-                                                                if(it->second == sockfd)
-                                                                {
-                                                                        port_to_sockfd.erase(it);
-                                                                        break;
-                                                                }
-                                                        }
-                                                }
-                                                break;
-                                        }
+							hash_map<int, int>::iterator it = port_to_sockfd.begin();
+							while(it != port_to_sockfd.end())
+							{
+								if(it->second == sockfd)
+								{
+									port_to_sockfd.erase(it);
+									break;
+								}
+							}
+						}
+						break;
+					}
 					else
 					{
 						if(bytes_received < sizeof(Pkt_header))
 						{
-							lg.err("data error");
-							break;
-						}
-
-						if(pkthdr->type == HELLO)
-						{
-							struct in_addr tmp;
-							pkthdr->datalen = 0;
-							tmp = pkthdr->src_ip;
-							pkthdr->src_ip = pkthdr->dst_ip;
-							pkthdr->dst_ip = tmp;
-							lg.dbg("send hello to %s", inet_ntoa(tmp));
-							if(send(sockfd, pkthdr, sizeof(Pkt_header), 0) < 0)
-							{
-								lg.err("send hello to %s error(%s)", inet_ntoa(tmp), strerror(errno));
-							}
-							continue;
+							lg.err("packet header error");
 						}
 
 						struct sockaddr_in cliaddr;
@@ -268,43 +257,49 @@ void Forwarder::run()
 							exit(EXIT_FAILURE);
 						}
 						int port = ntohs(cliaddr.sin_port);
+						string pkt_src_ip(inet_ntoa(pkthdr->src_ip));
+						ip_to_port[pkt_src_ip] = port;
 
-						string gateway_ip(inet_ntoa(pkthdr->src_ip));
-						ip_to_port[gateway_ip] = port;
-						lg.dbg("recv and process %d bytes from gateway(%s)", pkthdr->datalen, gateway_ip.c_str());
+						if(pkthdr->type == HELLO)
+						{
+							lg.dbg("send hello to %s", inet_ntoa(pkthdr->src_ip));
+							if(send(sockfd, pkthdr, sizeof(Pkt_header), 0) < 0)
+							{
+								lg.err("send hello error(%s)", strerror(errno));
+							}
+							continue;
+						}
+						
+						string d_ip(inet_ntoa(pkthdr->dst_ip));
+						string s_ip(inet_ntoa(pkthdr->src_ip));
+						lg.dbg("from %s to %s %d bytes", s_ip.c_str(), d_ip.c_str(), pkthdr->datalen);
 
 						int bytes_tosend = sizeof(Pkt_header) + pkthdr->datalen;
 						char* tosend = (char*)malloc(bytes_tosend);
 
-						struct in_addr tmp;
-						tmp = pkthdr->src_ip;
-						pkthdr->src_ip = pkthdr->dst_ip;
-						pkthdr->dst_ip = tmp;
 						memcpy(tosend, pkthdr, sizeof(Pkt_header));
 
 						if(recv(sockfd, tosend+sizeof(Pkt_header), pkthdr->datalen, 0) < pkthdr->datalen)
 						{
 							lg.err("recv error(%s)", strerror(errno));
-							break;
+							free(tosend);
+							continue;
 						}
 
-						int tosockfd = port_to_sockfd[ip_to_port[ip_map[gateway_ip]]];
+						int tosockfd = port_to_sockfd[ip_to_port[ip_map[pkt_src_ip]]];
 						if(tosockfd <= 0)
 						{
-							lg.err("connection from %s is error", ip_map[gateway_ip].c_str());
-							break;
+							lg.err("connection from %s is error", ip_map[pkt_src_ip].c_str());
+							free(tosend);
+							continue;
 						}
 
-						if(send(tosockfd, tosend, bytes_tosend, MSG_NOSIGNAL) < bytes_tosend)
-						{
-							lg.err("send to %s error(%s)", ip_map[gateway_ip].c_str(), strerror(errno));
-							break;
-						}
+						if(send(tosockfd, tosend, bytes_tosend, MSG_NOSIGNAL) < 0)
+							lg.err("send to %s error(%s)", ip_map[pkt_src_ip].c_str(), strerror(errno));
 						else
-						{
-							lg.dbg("send to %s successed", ip_map[gateway_ip].c_str());
-							free(tosend);
-						}
+							lg.dbg("send to %s successed", ip_map[pkt_src_ip].c_str());
+
+						free(tosend);
 					}
 				}
 			}
