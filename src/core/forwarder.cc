@@ -285,38 +285,29 @@ void Forwarder::run()
 				while(1)
 				{
 					Pkt_header* pkthdr = new Pkt_header;
-					int bytes_received = recv(sockfd, pkthdr, sizeof(Pkt_header), 0);
-					if(bytes_received <= 0)
+					if(recvn_non_block(sockfd, pkthdr, sizeof(Pkt_header)) < sizeof(Pkt_header))
 					{
-						if (errno != EAGAIN && errno != EWOULDBLOCK)
+						lg.err("recv data header error(%s)", strerror(errno));
+						if (epoll_ctl(epollfd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]) < 0)
 						{
-							lg.err("recv error(%s)", strerror(errno));
-							if (epoll_ctl(epollfd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]) < 0)
-							{
-								lg.err("epoll_ctl error(%s)", strerror(errno));
-								exit(EXIT_FAILURE);
-							}
-							close(sockfd);
+							lg.err("epoll_ctl error(%s)", strerror(errno));
+							exit(EXIT_FAILURE);
+						}
+						close(sockfd);
 
-							hash_map<int, int>::iterator it = port_to_sockfd.begin();
-							while(it != port_to_sockfd.end())
+						hash_map<int, int>::iterator it = port_to_sockfd.begin();
+						while(it != port_to_sockfd.end())
+						{
+							if(it->second == sockfd)
 							{
-								if(it->second == sockfd)
-								{
-									port_to_sockfd.erase(it);
-									break;
-								}
+								port_to_sockfd.erase(it);
+								break;
 							}
 						}
 						break;
 					}
 					else
 					{
-						if(bytes_received < sizeof(Pkt_header))
-						{
-							lg.err("packet header error");
-						}
-
 						struct sockaddr_in cliaddr;
 						socklen_t cliaddrlen = sizeof(cliaddr);
 						if(getpeername(sockfd, (struct sockaddr*) &cliaddr, &cliaddrlen) < 0)
@@ -331,7 +322,7 @@ void Forwarder::run()
 						if(pkthdr->type == HELLO)
 						{
 							lg.dbg("send hello to %s", inet_ntoa(pkthdr->src_ip));
-							if(send(sockfd, pkthdr, sizeof(Pkt_header), 0) < 0)
+							if(sendn_non_block(sockfd, pkthdr, sizeof(Pkt_header)) < sizeof(Pkt_header))
 							{
 								lg.err("send hello error(%s)", strerror(errno));
 							}
@@ -347,7 +338,7 @@ void Forwarder::run()
 
 						memcpy(tosend, pkthdr, sizeof(Pkt_header));
 
-						if(recv(sockfd, tosend+sizeof(Pkt_header), pkthdr->datalen, 0) < pkthdr->datalen)
+						if(recvn_non_block(sockfd, tosend+sizeof(Pkt_header), pkthdr->datalen) < pkthdr->datalen)
 						{
 							lg.err("recv error(%s)", strerror(errno));
 							free(tosend);
@@ -362,7 +353,7 @@ void Forwarder::run()
 							continue;
 						}
 
-						if(send(tosockfd, tosend, bytes_tosend, MSG_NOSIGNAL) < 0)
+						if(sendn_non_block(tosockfd, tosend, bytes_tosend) < 0)
 							lg.err("send to %s error(%s)", ip_map[pkt_src_ip].c_str(), strerror(errno));
 						else
 							lg.dbg("send to %s successed", ip_map[pkt_src_ip].c_str());
