@@ -27,24 +27,23 @@ using namespace std;
 namespace rusv
 {
 
-struct Pkt_header
-{
-        uint8_t version;
-        uint8_t type;
-        uint16_t datalen;
-        struct in_addr src_ip, dst_ip;
-};
-
-
-enum Pkt_type
-{
-        HELLO,
-        IP
-};
-
 static Vlog_module lg("forwarder");
 
 const char* conf_file = "conf/forwarder.xml";
+
+struct Pkt_header
+{
+	uint8_t version;
+	uint8_t type;
+	uint16_t datalen;
+	struct in_addr src_ip, dst_ip;
+};
+
+enum Pkt_type
+{
+	HELLO,
+	IP
+};
 
 static void make_sockfd_non_block(int sockfd)
 {
@@ -62,46 +61,11 @@ static void make_sockfd_non_block(int sockfd)
 	}
 }
 
-static ssize_t recvn_non_block(int sockfd, void* buffer, size_t n)
-{
-	size_t nleft = n;
-	ssize_t nrecv = 0;
-	char* ptr = buffer;
-	int first_recv = 0;
-	while(nleft > 0 )
-	{
-		if(first_recv != 0)
-		{
-			fd_set rset;
-			FD_ZERO(&rset);
-			FD_SET(sockfd, &rset);
-			if(select(sockfd+1, &rset, NULL, NULL, NULL) < 0)
-				return -1;
-		}
-
-		nrecv = recv(sockfd, ptr, nleft, 0);
-		if(first_recv == 0)
-			first_recv = 1;
-		if(nrecv < 0)
-		{
-			if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-				nrecv = 0;
-			else
-				return -1;
-		}
-		else if(nrecv == 0)
-			break; // EOF
-		nleft -= nrecv;
-		ptr += nrecv;
-	}
-	return (n-nleft);
-}
-
 static ssize_t sendn_non_block(int sockfd, void* buffer, size_t n)
 {
 	size_t nleft = n;
 	ssize_t nsend = 0;
-	const char* ptr = buffer;
+	const char* ptr = (char*)buffer;
 	int first_send = 0;
 
 	while(nleft > 0)
@@ -112,7 +76,7 @@ static ssize_t sendn_non_block(int sockfd, void* buffer, size_t n)
 			FD_ZERO(&wset);
 			FD_SET(sockfd, &wset);
 			if(select(sockfd+1, NULL, &wset, NULL, NULL) < 0)
-				return -1
+				return -1;
 		}
 		nsend = send(sockfd, ptr, nleft, MSG_NOSIGNAL);
 		if(first_send == 0)
@@ -128,6 +92,33 @@ static ssize_t sendn_non_block(int sockfd, void* buffer, size_t n)
 		ptr += nsend;
 	}
 	return (n - nleft);
+}
+
+Recv_state Recv_buf::recv()
+{
+	char* ptr = bufptr;
+	int nleft = bufsize - nbyte;
+	int nrecv = ::recv(sockfd, ptr+nbyte, nleft, 0);
+	if(nrecv < 0)
+	{
+		return ERROR;
+	}
+	else if(nrecv == 0)
+	{
+		return CLOSED;
+	}
+	else
+	{
+		nbyte += nrecv;
+		if(nbyte == bufsize)
+		{
+			return RECEIVED;
+		}
+		else
+		{
+			return RECEIVING;
+		}
+	}
 }
 
 Forwarder::Forwarder()
@@ -245,7 +236,6 @@ void Forwarder::run()
 				close (events[i].data.fd);
 				continue;
 			}
-
 			else if(events[i].data.fd == listenfd)
 			{
 				while(1)
@@ -260,6 +250,12 @@ void Forwarder::run()
 							lg.err("accept error(%s)", strerror(errno));
 						}
 						break;
+					}
+
+					if(strcmp(inet_ntoa(cliaddr.sin_addr), "59.64.255.65") != 0)
+					{
+						close(connsockfd);
+						continue;
 					}
 
 					lg.dbg("new connection from %s", inet_ntoa(cliaddr.sin_addr));
@@ -281,85 +277,92 @@ void Forwarder::run()
 			}
 			else
 			{
-				int sockfd = events[i].data.fd;
+				int fromsockfd = events[i].data.fd;
+				Recv_buf* recvbuf = sockfd_to_recvbuf[fromsockfd];
+				if(recvbuf == NULL)
+				{
+					recvbuf = new Recv_buf(fromsockfd, sizeof(Pkt_header));
+					sockfd_to_recvbuf[fromsockfd] = recvbuf;
+				}
+
+				struct sockaddr_in cliaddr;
+				socklen_t cliaddrlen = sizeof(cliaddr);
+				if(getpeername(fromsockfd, (struct sockaddr*) &cliaddr, &cliaddrlen) < 0)
+				{
+					lg.err("getpeername error(%s)", strerror(errno));
+					exit(EXIT_FAILURE);
+				}
+				int port = ntohs(cliaddr.sin_port);
+
 				while(1)
 				{
-					Pkt_header* pkthdr = new Pkt_header;
-					if(recvn_non_block(sockfd, pkthdr, sizeof(Pkt_header)) < sizeof(Pkt_header))
+					Recv_state recv_state = recvbuf->recv();
+					if(recv_state == ERROR || recv_state == CLOSED)
 					{
-						lg.err("recv data header error(%s)", strerror(errno));
-						if (epoll_ctl(epollfd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]) < 0)
+						if (errno != EAGAIN && errno != EWOULDBLOCK)
 						{
-							lg.err("epoll_ctl error(%s)", strerror(errno));
-							exit(EXIT_FAILURE);
-						}
-						close(sockfd);
-
-						hash_map<int, int>::iterator it = port_to_sockfd.begin();
-						while(it != port_to_sockfd.end())
-						{
-							if(it->second == sockfd)
+							lg.err("recv error(%s)", strerror(errno));
+							if (epoll_ctl(epollfd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]) < 0)
 							{
-								port_to_sockfd.erase(it);
-								break;
+								lg.err("epoll_ctl error(%s)", strerror(errno));
+								exit(EXIT_FAILURE);
 							}
+							close(fromsockfd);
+
+							port_to_sockfd.erase(port);
+
+							delete recvbuf;
+							recvbuf = NULL;
+							sockfd_to_recvbuf.erase(fromsockfd);
 						}
 						break;
 					}
-					else
+					if(recv_state == RECEIVING)
 					{
-						struct sockaddr_in cliaddr;
-						socklen_t cliaddrlen = sizeof(cliaddr);
-						if(getpeername(sockfd, (struct sockaddr*) &cliaddr, &cliaddrlen) < 0)
+						break;
+					}
+
+					Pkt_header* pkthdr = (Pkt_header*)recvbuf->get_bufptr();
+					string pkt_src_ip(inet_ntoa(pkthdr->src_ip));
+					ip_to_port[pkt_src_ip] = port;
+
+					if(pkthdr->type == HELLO)
+					{
+						if(sendn_non_block(fromsockfd, pkthdr, sizeof(Pkt_header)) < 0)
 						{
-							lg.err("getpeername error(%s)", strerror(errno));
-							exit(EXIT_FAILURE);
+							lg.err("send hello error(%s)", strerror(errno));
 						}
-						int port = ntohs(cliaddr.sin_port);
-						string pkt_src_ip(inet_ntoa(pkthdr->src_ip));
-						ip_to_port[pkt_src_ip] = port;
-
-						if(pkthdr->type == HELLO)
+						else
 						{
-							lg.dbg("send hello to %s", inet_ntoa(pkthdr->src_ip));
-							if(sendn_non_block(sockfd, pkthdr, sizeof(Pkt_header)) < sizeof(Pkt_header))
-							{
-								lg.err("send hello error(%s)", strerror(errno));
-							}
-							continue;
+							lg.dbg("send hello to %s successed", inet_ntoa(pkthdr->src_ip));
 						}
-						
-						string d_ip(inet_ntoa(pkthdr->dst_ip));
-						string s_ip(inet_ntoa(pkthdr->src_ip));
-						lg.dbg("from %s to %s %d bytes", s_ip.c_str(), d_ip.c_str(), pkthdr->datalen);
+						recvbuf->reset(sizeof(Pkt_header));
+						continue;
+					}
 
-						int bytes_tosend = sizeof(Pkt_header) + pkthdr->datalen;
-						char* tosend = (char*)malloc(bytes_tosend);
-
-						memcpy(tosend, pkthdr, sizeof(Pkt_header));
-
-						if(recvn_non_block(sockfd, tosend+sizeof(Pkt_header), pkthdr->datalen) < pkthdr->datalen)
-						{
-							lg.err("recv error(%s)", strerror(errno));
-							free(tosend);
-							continue;
-						}
-
+					if(recvbuf->get_bufsize() > sizeof(Pkt_header))
+					{
 						int tosockfd = port_to_sockfd[ip_to_port[ip_map[pkt_src_ip]]];
 						if(tosockfd <= 0)
 						{
 							lg.err("connection from %s is error", ip_map[pkt_src_ip].c_str());
-							free(tosend);
+							recvbuf->reset(sizeof(Pkt_header));
 							continue;
 						}
-
-						if(sendn_non_block(tosockfd, tosend, bytes_tosend) < 0)
-							lg.err("send to %s error(%s)", ip_map[pkt_src_ip].c_str(), strerror(errno));
+						if(sendn_non_block(tosockfd, recvbuf->get_bufptr(), recvbuf->get_bufsize()) < 0)
+						{
+							lg.err("send data error(%s)", strerror(errno));
+						}
 						else
-							lg.dbg("send to %s successed", ip_map[pkt_src_ip].c_str());
-
-						free(tosend);
+						{
+							lg.dbg("send %d bytes to %s successed", recvbuf->get_bufsize(), inet_ntoa(pkthdr->dst_ip));
+						}
+						recvbuf->reset(sizeof(Pkt_header));
+						continue;
 					}
+
+					int pktlen = sizeof(Pkt_header) + pkthdr->datalen;
+					recvbuf->realloc(pktlen);
 				}
 			}
 		}
